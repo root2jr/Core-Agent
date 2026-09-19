@@ -1,5 +1,12 @@
-import { useState } from 'react';
-import { StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import React, { useEffect, useState } from 'react';
+import {
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  View,
+  ScrollView,
+  Vibration,
+} from 'react-native';
 import * as Linking from 'expo-linking';
 import * as Speech from 'expo-speech';
 import {
@@ -7,101 +14,170 @@ import {
   useSpeechRecognitionEvent,
 } from 'expo-speech-recognition';
 
-const BACKEND_URL = 'https://performances-jpeg-wheel-evanescence.trycloudflare.com';
-const MASTER_KEY = 'your-master-key-here'; // Replace or load via environment
+const WAKE_WORD = 'jarvis'; // or 'core'
+
+type AgentState = 'IDLE' | 'LISTENING' | 'PROCESSING' | 'SPEAKING';
 
 export default function App() {
-  const [isListening, setIsListening] = useState(false);
-  const [status, setStatus] = useState('IDLE');
+  const [state, setState] = useState<AgentState>('IDLE');
   const [transcript, setTranscript] = useState('');
+  const [logs, setLogs] = useState<string[]>([]);
+  const [isArmed, setIsArmed] = useState(false);
 
-  useSpeechRecognitionEvent('result', async (event) => {
-    const text = event.results[0]?.transcript;
-    if (text) {
-      setTranscript(text);
-      if (event.isFinal) {
-        await dispatchToAgent(text);
+  const log = (msg: string) => {
+    setLogs((prev) => [`[${new Date().toLocaleTimeString()}] ${msg}`, ...prev.slice(0, 49)]);
+  };
+
+  useSpeechRecognitionEvent('start', () => {
+    setState('LISTENING');
+  });
+
+  useSpeechRecognitionEvent('result', (event) => {
+    const raw = event.results[0]?.transcript?.trim().toLowerCase();
+    if (!raw) return;
+
+    setTranscript(raw);
+
+    if (event.isFinal) {
+      log(`Heard: "${raw}"`);
+
+      // Check for wake word prefix
+      if (raw.startsWith(WAKE_WORD)) {
+        Vibration.vibrate(60);
+        const command = raw.replace(WAKE_WORD, '').trim();
+        handleDetectedCommand(command || 'system status');
+      } else {
+        log(`Ignored (missing '${WAKE_WORD}' prefix)`);
       }
     }
   });
 
   useSpeechRecognitionEvent('end', () => {
-    setIsListening(false);
-    setStatus('IDLE');
+    // If armed, automatically reopen the mic
+    if (isArmed && state !== 'SPEAKING') {
+      startListeningLoop();
+    } else if (!isArmed) {
+      setState('IDLE');
+    }
   });
 
-  const toggleListening = async () => {
-    if (isListening) {
-      ExpoSpeechRecognitionModule.stop();
-      setIsListening(false);
-      setStatus('IDLE');
-      return;
+  useSpeechRecognitionEvent('error', (event) => {
+    log(`Recognition notice: ${event.message || event.error}`);
+    if (isArmed && state !== 'SPEAKING') {
+      setTimeout(() => startListeningLoop(), 500);
     }
+  });
 
-    const { granted } = await ExpoSpeechRecognitionModule.requestPermissionsAsync();
-    if (!granted) {
-      setStatus('PERMISSION_DENIED');
-      return;
+  const startListeningLoop = async () => {
+    try {
+      const { granted } = await ExpoSpeechRecognitionModule.requestPermissionsAsync();
+      if (!granted) {
+        log('Mic permission denied');
+        setIsArmed(false);
+        setState('IDLE');
+        return;
+      }
+      ExpoSpeechRecognitionModule.start({
+        lang: 'en-US',
+        continuous: true,
+        interimResults: true,
+      });
+    } catch (e: any) {
+      log(`Loop restart error: ${e.message}`);
     }
-
-    setTranscript('');
-    setStatus('LISTENING');
-    setIsListening(true);
-    ExpoSpeechRecognitionModule.start({ lang: 'en-US' });
   };
 
-  const dispatchToAgent = async (commandText: string) => {
-    setStatus('PROCESSING');
-    try {
-      const response = await fetch(`${BACKEND_URL}/agent/command`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-passcode': MASTER_KEY,
+  const handleDetectedCommand = (command: string) => {
+    setState('PROCESSING');
+    log(`Executing Command: "${command}"`);
+
+    // Temporarily halt mic while speaking feedback
+    ExpoSpeechRecognitionModule.stop();
+
+    setTimeout(() => {
+      setState('SPEAKING');
+      const response = `Acknowledged. Executing ${command}.`;
+      log(`TTS: "${response}"`);
+
+      Speech.speak(response, {
+        language: 'en',
+        rate: 1.1,
+        onDone: () => {
+          log('Ready for next command');
+          if (isArmed) {
+            startListeningLoop();
+          } else {
+            setState('IDLE');
+          }
         },
-        body: JSON.stringify({ transcript: commandText }),
       });
+    }, 300);
+  };
 
-      const data = await response.json();
-      setStatus('RESPONDING');
+  const toggleArm = async () => {
+    if (isArmed) {
+      setIsArmed(false);
+      ExpoSpeechRecognitionModule.stop();
+      setState('IDLE');
+      log('Daemon disarmed.');
+    } else {
+      setIsArmed(true);
+      log(`Daemon armed. Listening continuously for "${WAKE_WORD} ..."`);
+      startListeningLoop();
+    }
+  };
 
-      if (data.text_response) {
-        Speech.speak(data.text_response, { language: 'en', rate: 1.0 });
-      }
-
-      // If the action returned a link to the main core app, launch it
-      if (data.deep_link) {
-        const canOpen = await Linking.canOpenURL(data.deep_link);
-        if (canOpen) {
-          await Linking.openURL(data.deep_link);
-        }
-      }
-    } catch {
-      Speech.speak('Failed to execute command on Core.');
-      setStatus('ERROR');
+  const testDeepLink = async () => {
+    const targetScheme = 'core://test?caller=agent';
+    try {
+      const canOpen = await Linking.canOpenURL(targetScheme);
+      log(`Can open ${targetScheme}? ${canOpen}`);
+      if (canOpen) await Linking.openURL(targetScheme);
+    } catch (err: any) {
+      log(`Link error: ${err.message}`);
     }
   };
 
   return (
     <View style={styles.container}>
-      <Text style={styles.header}>VANTA DAEMON</Text>
-      <Text style={styles.status}>STATUS: {status}</Text>
-
-      <View style={styles.console}>
-        <Text style={styles.consoleText}>
-          {transcript ? `> ${transcript}` : '> Awaiting voice input...'}
+      <View style={styles.header}>
+        <Text style={styles.title}>CORE-AGENT</Text>
+        <Text style={[styles.statePill, isArmed && styles.stateActive]}>
+          {isArmed ? state : 'DISARMED'}
         </Text>
       </View>
 
-      <TouchableOpacity
-        style={[styles.micButton, isListening && styles.micButtonActive]}
-        onPress={toggleListening}
-        activeOpacity={0.8}
-      >
-        <Text style={styles.micButtonText}>
-          {isListening ? 'HALT' : 'ENGAGE'}
+      <View style={styles.card}>
+        <Text style={styles.cardLabel}>CONTINUOUS LISTENER</Text>
+        <Text style={styles.cardContent}>
+          {transcript ? `> ${transcript}` : `> Say "${WAKE_WORD} [command]"...`}
         </Text>
-      </TouchableOpacity>
+      </View>
+
+      <View style={styles.controlsRow}>
+        <TouchableOpacity
+          style={[styles.btn, isArmed ? styles.btnStop : styles.btnPrimary]}
+          onPress={toggleArm}
+          activeOpacity={0.8}
+        >
+          <Text style={styles.btnText}>
+            {isArmed ? 'DISARM DAEMON' : 'ARM CONTINUOUS MIC'}
+          </Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity style={styles.btnSecondary} onPress={testDeepLink} activeOpacity={0.8}>
+          <Text style={styles.btnSecondaryText}>TEST LINK</Text>
+        </TouchableOpacity>
+      </View>
+
+      <Text style={styles.logLabel}>SYSTEM LOGS</Text>
+      <ScrollView style={styles.logBox} contentContainerStyle={{ paddingBottom: 20 }}>
+        {logs.map((item, idx) => (
+          <Text key={idx} style={styles.logItem}>
+            {item}
+          </Text>
+        ))}
+      </ScrollView>
     </View>
   );
 }
@@ -110,56 +186,116 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: '#000000',
-    alignItems: 'center',
-    justifyContent: 'center',
-    padding: 24,
+    paddingHorizontal: 20,
+    paddingTop: 54,
   },
   header: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 20,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255,255,255,0.08)',
+    paddingBottom: 14,
+  },
+  title: {
     color: '#ffffff',
-    fontSize: 16,
+    fontSize: 15,
     fontWeight: '800',
-    letterSpacing: 2,
-    marginBottom: 8,
+    letterSpacing: 1.5,
   },
-  status: {
-    color: '#666666',
-    fontSize: 12,
-    fontWeight: '700',
+  statePill: {
     fontFamily: 'monospace',
-    marginBottom: 24,
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#666666',
   },
-  console: {
-    width: '100%',
-    minHeight: 100,
+  stateActive: {
+    color: '#00ff66',
+  },
+  card: {
     backgroundColor: '#0a0a0a',
+    borderRadius: 14,
     borderWidth: 1,
     borderColor: 'rgba(255, 255, 255, 0.08)',
-    borderRadius: 16,
     padding: 16,
+    minHeight: 100,
     justifyContent: 'center',
-    marginBottom: 32,
+    marginBottom: 16,
   },
-  consoleText: {
-    color: '#cccccc',
+  cardLabel: {
+    color: '#555555',
+    fontSize: 10,
+    fontWeight: '700',
     fontFamily: 'monospace',
-    fontSize: 13,
+    marginBottom: 6,
+  },
+  cardContent: {
+    color: '#ffffff',
+    fontSize: 14,
+    fontFamily: 'monospace',
     lineHeight: 20,
   },
-  micButton: {
-    width: 140,
-    height: 50,
-    backgroundColor: '#ffffff',
-    borderRadius: 25,
+  controlsRow: {
+    flexDirection: 'row',
+    gap: 10,
+    marginBottom: 20,
+  },
+  btn: {
+    flex: 1.5,
+    height: 48,
+    borderRadius: 12,
     alignItems: 'center',
     justifyContent: 'center',
   },
-  micButtonActive: {
+  btnPrimary: {
+    backgroundColor: '#ffffff',
+  },
+  btnStop: {
     backgroundColor: '#ff4444',
   },
-  micButtonText: {
+  btnSecondary: {
+    flex: 1,
+    height: 48,
+    borderRadius: 12,
+    backgroundColor: 'rgba(255, 255, 255, 0.06)',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.1)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  btnText: {
     color: '#000000',
     fontWeight: '800',
-    fontSize: 13,
-    letterSpacing: 1,
+    fontSize: 11,
+    letterSpacing: 0.5,
+  },
+  btnSecondaryText: {
+    color: '#cccccc',
+    fontWeight: '700',
+    fontSize: 11,
+    letterSpacing: 0.5,
+  },
+  logLabel: {
+    color: '#555555',
+    fontSize: 11,
+    fontWeight: '700',
+    fontFamily: 'monospace',
+    marginBottom: 8,
+  },
+  logBox: {
+    flex: 1,
+    backgroundColor: '#050505',
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.04)',
+    padding: 12,
+  },
+  logItem: {
+    color: '#888888',
+    fontFamily: 'monospace',
+    fontSize: 11,
+    lineHeight: 18,
+    marginBottom: 4,
   },
 });
